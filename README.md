@@ -1,7 +1,10 @@
 # Visual Grounding with Vision-Language Model
 
 This implementation provides a vision-language model for visual grounding tasks, where the model predicts bounding box coordinates for objects described in natural language.
-
+# Note
+- This repository is not fully implemented and is not ready to use.
+  - 아직 완전히 구현 되지 않았습니다 !
+- Also, this README page also is not providing proper information to use.
 ## Features
 
 - Uses a generative approach with special tokens for bounding box representation
