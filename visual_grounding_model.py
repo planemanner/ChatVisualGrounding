@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoProcessor
 from PIL import Image
-import numpy as np
 from torch.nn import functional as F
 
 class BBoxEncoder(nn.Module):
@@ -55,7 +54,7 @@ class VisualGroundingModel(nn.Module):
         
         # Add special tokens for bounding box and image
         special_tokens = {
-            "additional_special_tokens": ["<box>", "</box>", "<image>"]
+            "additional_special_tokens": ["<box>", "</box>", "<image>", "<sep>"]
         }
         self.tokenizer.add_special_tokens(special_tokens)
         self.model.resize_token_embeddings(len(self.tokenizer))
@@ -63,6 +62,7 @@ class VisualGroundingModel(nn.Module):
         # Get special token IDs
         self.image_token_id = self.tokenizer.convert_tokens_to_ids("<image>")
         self.box_token_id = self.tokenizer.convert_tokens_to_ids("<box>")
+        self.sep_token_id = self.tokenizer.convert_tokens_to_ids("<sep>")
         
         # Initialize bbox encoder and decoder
         self.bbox_encoder = BBoxEncoder(hidden_size)
@@ -117,7 +117,7 @@ class VisualGroundingModel(nn.Module):
         context_image_features = []
         context_bboxes = []
         
-        for example in examples:
+        for i, example in enumerate(examples):
             # Process image
             if 'image' in example:
                 img_feature = self.process_image(example['image'])
@@ -125,7 +125,11 @@ class VisualGroundingModel(nn.Module):
             
             # Add text prompt
             if 'text' in example:
-                context_text.append(example['text'])
+                # Add EOS token at the end of each example
+                context_text.append(example['text'] + " <sep>")
+                # Add separator token between examples (except for the last one)
+                if i < len(examples) - 1:
+                    context_text.append("<sep>")
             
             # Add bounding boxes
             if 'bboxes' in example:
@@ -160,7 +164,7 @@ class VisualGroundingModel(nn.Module):
         if context_examples:
             context_text, context_image_features, context_bboxes = self.process_context_examples(context_examples)
         
-        # Combine context with current query
+        # Combine context with current query 
         combined_text = context_text + " " + text_prompt if context_text else text_prompt
         combined_bboxes = context_bboxes + (bboxes if bboxes is not None else [])
         
@@ -173,7 +177,7 @@ class VisualGroundingModel(nn.Module):
             'all_image_features': all_image_features
         }
     
-    def embed_inputs_with_special_tokens(self, text, input_ids, attention_mask, image_features, bboxes=None):
+    def embed_inputs_with_special_tokens(self, input_ids, image_features, bboxes=None):
         """
         Embed inputs and replace special tokens with corresponding features.
         
@@ -192,12 +196,8 @@ class VisualGroundingModel(nn.Module):
         input_embeddings = word_embeddings(input_ids)
         
         # Replace <image> tokens with image features
-        image_token_positions = (input_ids == self.image_token_id).nonzero(as_tuple=True)
-        
-        # For each <image> token, use the corresponding image feature
-        for idx, (batch_idx, pos_idx) in enumerate(zip(image_token_positions[0], image_token_positions[1])):
-            if idx < len(image_features):
-                input_embeddings[batch_idx, pos_idx] = image_features[idx][0]  # [0] to get the first item from batch dim
+        image_token_positions = (input_ids == self.image_token_id)
+        input_embeddings[image_token_positions, ...] = image_features
         
         # Replace <box> tokens with bbox features if available
         if bboxes is not None and len(bboxes) > 0:
@@ -206,12 +206,7 @@ class VisualGroundingModel(nn.Module):
             # Encode bounding boxes
             bbox_tensor = torch.tensor(bboxes)
             bbox_features = self.encode_bbox(bbox_tensor)
-            projected_bbox_features = self.bbox_projection(bbox_features)
-            
-            # Replace each <box> token with its corresponding bbox feature
-            for idx, (batch_idx, pos_idx) in enumerate(zip(box_token_positions[0], box_token_positions[1])):
-                if idx < len(bboxes):
-                    input_embeddings[batch_idx, pos_idx] = projected_bbox_features[idx]
+            input_embeddings[box_token_positions, ...] = bbox_features
         
         return input_embeddings
     
@@ -230,15 +225,15 @@ class VisualGroundingModel(nn.Module):
         """
         # Prepare inputs with context
         inputs = self.prepare_in_context_inputs(
-            image=image,
-            text_prompt=text_prompt,
-            bboxes=bboxes,
-            context_examples=context_examples
+            image=image, # query image
+            text_prompt=text_prompt, # query text
+            bboxes=bboxes, # query bboxes
+            context_examples=context_examples # context examples
         )
         
         # Tokenize combined text
         tokenized = self.tokenizer(
-            inputs['combined_text'],
+            inputs['combined_text'], # <box> 를 비롯한 in-context learning 에 필요한 모든 텍스트
             padding=True,
             truncation=True,
             max_length=self.max_length,
@@ -247,9 +242,7 @@ class VisualGroundingModel(nn.Module):
         
         # Embed inputs and replace special tokens
         input_embeddings = self.embed_inputs_with_special_tokens(
-            text=inputs['combined_text'],
             input_ids=tokenized['input_ids'],
-            attention_mask=tokenized['attention_mask'],
             image_features=inputs['all_image_features'],
             bboxes=inputs['combined_bboxes']
         )
@@ -263,15 +256,12 @@ class VisualGroundingModel(nn.Module):
             temperature=0.7,
             do_sample=True
         )
-        
-        # Process output
+        box_positions = outputs == self.box_token_id
+        box_hidden_states = outputs.hidden_states[box_positions, ...] # -1, hidden_size
+        predicted_bboxes = self.bbox_decoder(box_hidden_states)
         generated_texts = self.tokenizer.batch_decode(outputs, skip_special_tokens=False)
         
-        # Extract bbox features and decode them
-        bbox_features = self.model.get_bbox_features(outputs)
-        predicted_bboxes = self.decode_bbox(bbox_features)
-        
-        return predicted_bboxes[0], generated_texts[0]
+        return predicted_bboxes, generated_texts
     
     def forward(self, images, texts, bboxes=None, labels=None, bboxes_mask=None):
         """
